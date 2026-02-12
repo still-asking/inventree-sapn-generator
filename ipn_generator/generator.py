@@ -1,71 +1,191 @@
 from plugin import InvenTreePlugin
 from plugin.mixins import EventMixin, SettingsMixin
-from part.models import Part
+from part.models import Part, PartParameter
 
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 
 import logging
 import re
 
 logger = logging.getLogger("inventree")
 
-PERMITTED_SPECIAL_LITERALS = "\-.:/\\"
+# SAPN format constants
+SAPN_PREFIX = "SAPN"
+SAPN_CCC_PARAM = "SA_CCC"
+SAPN_SS_PARAM = "SA_SS"
+SAPN_MAX_SEQUENCE = 99999
+SAPN_RETRY_ATTEMPTS = 10
+
+# Regex patterns for validation
+CCC_PATTERN = re.compile(r"^[A-Z]{3}$")
+SS_PATTERN = re.compile(r"^\d{2}$")
 
 
-def validate_pattern(pattern):
-    """Validates pattern groups"""
-    regex = re.compile(r"(\{\d+\+?\})|(\[(?!\w\])(?:\w+|(?:\w-\w)+)+\])")
-    if not regex.search(pattern):
-        raise ValidationError("Pattern must include more than Literals")
-
-    return True
+def validate_ccc(value: str) -> bool:
+    """Validate CCC component (3 uppercase letters)."""
+    return bool(CCC_PATTERN.match(value))
 
 
-class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
-    """Plugin to generate IPN automatically"""
+def validate_ss(value: str) -> bool:
+    """Validate SS component (2 digits)."""
+    return bool(SS_PATTERN.match(value))
 
-    AUTHOR = "Nichlas W."
+
+def get_part_parameter_value(part, parameter_name: str) -> str | None:
+    """Get the value of a part parameter by name."""
+    try:
+        param = PartParameter.objects.filter(
+            part=part,
+            template__name=parameter_name
+        ).first()
+        if param:
+            return param.data
+    except Exception as e:
+        logger.warning(f"SAPN Generator: Error reading parameter {parameter_name}: {e}")
+    return None
+
+
+def compute_next_sapn(ccc: str, ss: str) -> str | None:
+    """
+    Compute the next SAPN for the given CCC and SS values.
+    
+    Args:
+        ccc: 3-letter category code (e.g., 'ELC')
+        ss: 2-digit subcategory code (e.g., '11')
+    
+    Returns:
+        The next SAPN string (e.g., 'SAPN-ELC-11-00042') or None if max reached.
+    
+    Raises:
+        ValueError: If the next sequence number would exceed 99999.
+    """
+    prefix = f"{SAPN_PREFIX}-{ccc}-{ss}-"
+    
+    # Find the maximum existing IPN with this prefix
+    # Since the suffix is fixed-width 5 digits, lexicographic ordering works
+    latest = Part.objects.filter(
+        IPN__startswith=prefix
+    ).order_by("-IPN").first()
+    
+    if latest:
+        # Extract the numeric suffix
+        try:
+            suffix = latest.IPN[len(prefix):]
+            current_num = int(suffix)
+            next_num = current_num + 1
+        except (ValueError, IndexError) as e:
+            logger.warning(f"SAPN Generator: Could not parse existing IPN '{latest.IPN}': {e}")
+            next_num = 1
+    else:
+        next_num = 1
+    
+    # Check for overflow
+    if next_num > SAPN_MAX_SEQUENCE:
+        raise ValueError(
+            f"SAPN sequence overflow for bucket ({ccc}, {ss}): "
+            f"next number {next_num} exceeds maximum {SAPN_MAX_SEQUENCE}. "
+            "Cannot generate more IPNs for this category/subcategory combination."
+        )
+    
+    return f"{prefix}{next_num:05d}"
+
+
+def generate_sapn_for_part(part) -> str | None:
+    """
+    Generate a SAPN for the given part based on its SA_CCC and SA_SS parameters.
+    
+    Args:
+        part: InvenTree Part object
+    
+    Returns:
+        Generated SAPN string or None if generation is not possible.
+    """
+    # Read CCC from part parameter SA_CCC
+    ccc = get_part_parameter_value(part, SAPN_CCC_PARAM)
+    if not ccc:
+        logger.warning(
+            f"SAPN Generator: Part {part.pk} missing required parameter '{SAPN_CCC_PARAM}'. "
+            "Cannot generate SAPN."
+        )
+        return None
+    
+    ccc = ccc.strip().upper()
+    if not validate_ccc(ccc):
+        logger.warning(
+            f"SAPN Generator: Part {part.pk} has invalid {SAPN_CCC_PARAM}='{ccc}'. "
+            f"Must match pattern ^[A-Z]{{3}}$. Cannot generate SAPN."
+        )
+        return None
+    
+    # Read SS from part parameter SA_SS
+    ss = get_part_parameter_value(part, SAPN_SS_PARAM)
+    if not ss:
+        logger.warning(
+            f"SAPN Generator: Part {part.pk} missing required parameter '{SAPN_SS_PARAM}'. "
+            "Cannot generate SAPN."
+        )
+        return None
+    
+    ss = ss.strip()
+    if not validate_ss(ss):
+        logger.warning(
+            f"SAPN Generator: Part {part.pk} has invalid {SAPN_SS_PARAM}='{ss}'. "
+            f"Must match pattern ^\\d{{2}}$. Cannot generate SAPN."
+        )
+        return None
+    
+    try:
+        return compute_next_sapn(ccc, ss)
+    except ValueError as e:
+        logger.error(f"SAPN Generator: {e}")
+        return None
+
+
+class SAPNGeneratorPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
+    """Plugin to generate SAPN (Sequential Auto Part Number) automatically.
+    
+    SAPN Format: SAPN-{CCC}-{SS}-{NNNNN}
+    - CCC: 3-letter code from part parameter SA_CCC
+    - SS: 2-digit code from part parameter SA_SS  
+    - NNNNN: 5-digit zero-padded sequence number per (CCC, SS) bucket
+    
+    Example: SAPN-ELC-11-00042
+    """
+
+    AUTHOR = "Nicolas Désilles, Modified from Nichlas W."
     DESCRIPTION = (
-        "Plugin for automatically assigning IPN to parts created with empty IPN fields.\
-        IPN pattern syntax can be found on the website linked here."
+        "Plugin for automatically assigning SAPN (Still Asking Part Numbers) to parts. "
+        "Uses SA_CCC and SA_SS part parameters to determine category codes. "
+        "Format: SAPN-{CCC}-{SS}-{NNNNN}"
     )
-    VERSION = "0.1"
-    WEBSITE = "https://github.com/LavissaWoW/inventree-ipn-generator"
+    VERSION = "0.1.0"
+    WEBSITE = "https://github.com/still-asking/inventree-sapn-generator"
 
-    NAME = "IPNGenerator"
-    SLUG = "ipngen"
-    TITLE = "IPN Generator"
+    NAME = "SAPNGenerator"
+    SLUG = "sapngen"
+    TITLE = "SAPN Generator"
 
     SETTINGS = {
         "ACTIVE": {
             "name": "Active",
-            "description": "IPN generator is active",
+            "description": "SAPN generator is active",
             "validator": bool,
             "default": True,
         },
         "ON_CREATE": {
             "name": "On Create",
-            "description": "Active when creating new parts",
+            "description": "Generate SAPN when creating new parts",
             "validator": bool,
             "default": True,
         },
         "ON_CHANGE": {
-            "name": "On Edit",
-            "description": "Active when editing existing parts",
+            "name": "On Change",
+            "description": "Generate SAPN when editing parts (only if IPN is empty)",
             "validator": bool,
             "default": False,
         },
-        "PATTERN": {
-            "name": "IPN pattern",
-            "description": "Pattern for IPN generation (See website for guide)",
-            "default": "(IPN-){4}",
-            "validator": validate_pattern,
-        },
     }
-
-    min_pattern_char = ord("A")
-    max_pattern_char = ord("Z")
-    skip_chars = range(ord("["), ord("a"))
 
     def wants_process_event(self, event):
         """Lets InvenTree know what events to listen for."""
@@ -82,7 +202,7 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         return False
 
     def process_event(self, event, *args, **kwargs):
-        """Main plugin handler function"""
+        """Main plugin handler function for SAPN generation."""
 
         if not self.get_setting("ACTIVE"):
             return False
@@ -92,183 +212,72 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
 
         # Events can fire on unrelated models
         if model != "Part":
-            logger.debug("IPN Generator: Event Model is not part")
+            logger.debug("SAPN Generator: Event model is not Part")
             return
 
-        # Don't create IPNs for parts with IPNs
-        part = Part.objects.get(id=id)
+        # Fetch the part
+        try:
+            part = Part.objects.get(id=id)
+        except Part.DoesNotExist:
+            logger.warning(f"SAPN Generator: Part with id {id} not found")
+            return
+
+        # Don't create IPNs for parts that already have one
         if part.IPN:
+            logger.debug(f"SAPN Generator: Part {id} already has IPN '{part.IPN}', skipping")
             return
 
-        expression = self.construct_regex(True)
-        latest = Part.objects.filter(IPN__regex=expression).order_by("-IPN").first()
-
-        if not latest:
-            part.IPN = self.construct_first_ipn()
-        else:
-            grouped_expression = self.construct_regex()
-            part.IPN = self.increment_ipn(grouped_expression, latest.IPN)
-
-        part.save()
+        # Attempt SAPN generation with retry for concurrency handling
+        for attempt in range(1, SAPN_RETRY_ATTEMPTS + 1):
+            try:
+                new_ipn = generate_sapn_for_part(part)
+                
+                if not new_ipn:
+                    # Generation failed due to missing/invalid parameters - already logged
+                    return
+                
+                # Use atomic transaction for the save
+                with transaction.atomic():
+                    # Re-check current max to avoid race conditions
+                    part.refresh_from_db()
+                    
+                    # Double-check IPN hasn't been set in the meantime
+                    if part.IPN:
+                        logger.debug(f"SAPN Generator: Part {id} IPN was set during processing, skipping")
+                        return
+                    
+                    # Recompute SAPN to get the latest sequence number
+                    ccc = get_part_parameter_value(part, SAPN_CCC_PARAM)
+                    ss = get_part_parameter_value(part, SAPN_SS_PARAM)
+                    
+                    if ccc and ss:
+                        ccc = ccc.strip().upper()
+                        ss = ss.strip()
+                        new_ipn = compute_next_sapn(ccc, ss)
+                    
+                    part.IPN = new_ipn
+                    part.save()
+                
+                logger.info(f"SAPN Generator: Assigned IPN '{new_ipn}' to Part {id}")
+                return
+                
+            except IntegrityError as e:
+                # Likely a uniqueness conflict - retry with new sequence
+                logger.warning(
+                    f"SAPN Generator: Integrity error on attempt {attempt}/{SAPN_RETRY_ATTEMPTS} "
+                    f"for Part {id}: {e}"
+                )
+                if attempt == SAPN_RETRY_ATTEMPTS:
+                    logger.error(
+                        f"SAPN Generator: Failed to assign IPN to Part {id} after "
+                        f"{SAPN_RETRY_ATTEMPTS} attempts due to integrity errors"
+                    )
+            except ValueError as e:
+                # Sequence overflow
+                logger.error(f"SAPN Generator: {e}")
+                return
+            except Exception as e:
+                logger.error(f"SAPN Generator: Unexpected error assigning IPN to Part {id}: {e}")
+                return
 
         return
-
-    def construct_regex(self, disable_groups=False):
-        """Constructs a valid regex from provided IPN pattern.
-        This regex is used to find the latest assigned IPN
-        """
-        regex = "^"
-
-        m = re.findall(
-            r"(\{\d+\+?\})|(\([\w\(\)\-.:/\\]+\))|(\[(?:\w+|\w-\w)+\])",
-            self.get_setting("PATTERN"),
-        )
-
-        for idx, group in enumerate(m):
-            numeric, literal, character = group
-            # Numeric, increment
-            if numeric:
-                start = "+" in numeric
-                g = numeric.strip("{}+")
-                if start:
-                    regex += "("
-                    if not disable_groups:
-                        regex += f"?P<Np{g}i{idx}>"
-                    for char in g:
-                        regex += f"[{char}-9]"
-                else:
-                    regex += "("
-                    if not disable_groups:
-                        regex += f"?P<N{g}i{idx}>"
-                    regex += f"\d{ {int(g)} }"
-                regex += ")"
-
-            # Literal, won't change
-            if literal:
-                lit = literal.strip("()")
-                regex += "("
-                if not disable_groups:
-                    regex += f"?P<Li{idx}>"
-                regex += f"{re.escape(lit)})"
-
-            # Letters, a collection or sequence
-            # Sequences incremented using ASCII
-            if character:
-                regex += "("
-                if not disable_groups:
-                    regex += "?P<C"
-
-                sequences = re.findall(r"(\w)(?!-)|(\w\-\w)", character)
-
-                exp = []
-                for seq in sequences:
-                    single, range = seq
-
-                    if single:
-                        exp.append(single)
-                    elif range:
-                        exp.append(range)
-
-                if not disable_groups:
-                    regex += f'{"_".join(exp).replace("-", "")}i{idx}>'
-                regex += f'[{"".join(exp)}]'
-                regex += ")"
-
-        regex += "$"
-
-        return regex
-
-    def increment_ipn(self, exp, latest):
-        """Deconstructs IPN pattern based on latest IPN and constructs a the next IPN in the series."""
-        m: re.Match = re.match(exp, latest)
-
-        ipn_list = []
-
-        # True after a fields has been incremented
-        # Does not apply on count rollover (i.e. 999 -> 001)
-        incremented = False
-
-        for key, val in reversed(m.groupdict().items()):
-            type, _ = key.split("i")
-
-            if incremented or type == "L":
-                ipn_list.append(val)
-                continue
-
-            if type == "N":
-                ipn_list.append(str(int(val) + 1))
-                incremented = True
-            elif type.startswith("C"):
-                integerized_char = ord(val)
-                choices = type[1:].split("_")
-
-                ranges = any(len(x) > 1 for x in choices)
-
-                if not ranges:
-                    if choices.index(val) == len(choices) - 1:
-                        ipn_list.append(choices[0])
-                    else:
-                        ipn_list.append(choices[choices.index(val) + 1])
-                        incremented = True
-                else:
-                    for choice in choices:
-                        if len(choice) > 1:
-                            min = ord(choice[0])
-                            max = ord(choice[1])
-                            if integerized_char in range(min, max + 1):
-                                if integerized_char == max:
-                                    ipn_list.append(choice[0])
-                                else:
-                                    ipn_list.append(chr(integerized_char + 1))
-                                incremented = True
-                                break
-                        elif choices.index(val) < choices.index(choice):
-                            ipn_list.append(choice)
-                            incremented = True
-                            break
-
-            elif type.startswith("N"):
-                if type[1] == "p":
-                    num = int(type[2:])
-                else:
-                    num = int(type[1:])
-                if type[1] == "p":
-                    next = int(val) + 1
-                    if len(str(next)) > len(type[2:]):
-                        ipn_list.append(type[2:])
-                    else:
-                        ipn_list.append(str(next))
-                elif len(str(int(val) + 1)) > num:
-                    ipn_list.append(str(1).zfill(num))
-                else:
-                    ipn_list.append(str(int(val) + 1).zfill(num))
-                    incremented = True
-
-        ipn_list.reverse()
-        return "".join(ipn_list)
-
-    def construct_first_ipn(self):
-        """No IPNs matching the pattern were found. Constructing the first IPN."""
-        m = re.findall(
-            r"(\{\d+\+?\})|(\([\w\(\)\-.:/\\]+\))|(\[(?:\w+|(?:\w-\w)+)\])",
-            self.get_setting("PATTERN"),
-        )
-
-        ipn = ""
-
-        for group in m:
-            numeric, literal, character = group
-            if numeric:
-                num = numeric.strip("{}+")
-                if "+" in numeric:
-                    ipn += num
-                else:
-                    ipn += str(1).zfill(int(num))
-
-            if literal:
-                ipn += literal.strip("()")
-
-            if character:
-                ipn += character.strip("[]")[0]
-
-        return ipn

@@ -1,68 +1,200 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Introduction
-This is a plugin for [InvenTree](https://github.com/inventree/InvenTree/).
-Installing this plugin enables the automatic generation if Internal Part Numbers (IPN) for parts.
+
+This is a plugin for [InvenTree](https://github.com/inventree/InvenTree/) that automatically generates **Still Asking Part Numbers (SAPN)** when parts are created.
+
+The SAPN format is: `SAPN-{CCC}-{SS}-{NNNNN}`
+
+- **CCC**: 3-letter category code (from part parameter `SA_CCC`)
+- **SS**: 2-digit subcategory code (from part parameter `SA_SS`)
+- **NNNNN**: 5-digit zero-padded sequence number, unique per (CCC, SS) bucket
+
+**Example**: `SAPN-ELC-11-00042`
+
+## How It Works
+
+1. When a part is created (or changed, if enabled), the plugin checks for the `SA_CCC` and `SA_SS` part parameters
+2. These parameters should be inherited from the part's category (typically set up using InvenTree's parameter templates)
+3. The plugin finds the highest existing IPN with the matching prefix and increments the sequence
+4. The new IPN is assigned to the part automatically
+
+### Important Notes
+
+- **CCC and SS always come from part parameters**, not from category names or paths
+- Parts in deeply nested categories work correctly as long as the parameters are inherited
+- Each (CCC, SS) combination has its own independent sequence starting at 00001
+- The sequence maximum is 99999; the plugin will **error out** (not wrap around) if this limit is reached
 
 ## Installation
-To automatically install the plugin when running `invoke install`:
-Add `inventree-ipn-generator` to your plugins.txt file.
 
-Or, install the plugin manually:
+### Method 1: Using plugins.txt (Recommended for Docker)
+
+Add the following line to your `plugins.txt` file:
 
 ```
-pip install inventree-ipn-generator
+git+https://github.com/still-asking/inventree-sapn-generator@main
 ```
 
-For the plugin to be listed as available, you need to enable "Event Integration" in your plugin settings.
-This setting is located with the Plugin Settings on the settings page.
+Then run the InvenTree plugin install routine:
+
+```bash
+invoke install
+```
+
+### Method 2: Direct pip install
+
+```bash
+pip install git+https://github.com/still-asking/inventree-sapn-generator@main
+```
+
+### Enabling the Plugin
+
+1. In InvenTree, go to **Settings** → **Plugin Settings**
+2. Enable **Event Integration** (required for the plugin to receive events)
+3. Find "SAPN Generator" in the plugin list and enable it
+4. Configure the plugin settings as needed
 
 ## Settings
 
-- Active - Enables toggling of plugin without having to disable it
-- On Create - If on, the plugin will assign IPNs to newly created parts
-- On Change - If on, the plugin will assign IPNs to parts after a change has been made.
-Enabling this setting will remove the ability to have parts without IPNs.
+| Setting       | Description                                             | Default |
+| ------------- | ------------------------------------------------------- | ------- |
+| **Active**    | Master toggle for the plugin                            | `True`  |
+| **On Create** | Generate SAPN when creating new parts                   | `True`  |
+| **On Change** | Generate SAPN when editing parts (only if IPN is empty) | `False` |
 
-## Pattern
-Part Number patterns follow three basic groups. Literals, Numerics, and characters.
-When incrementing a part number, the rightmost group that is mutable will be incremented.
-All groups can be combined in any order.
+## Setup Requirements
 
-A pattern cannot consist of _only_ Literals.
+### 1. Create Parameter Templates
 
-For any pattern, only the rightmost non-literal group will be incremented.
-When this group rolls over its max, the next non-literal group to the left will be incremented.
-Example: Given the groups (named for demo): L1C1N1C2L2
-Incrementing follows this order: C2, N1, C1.
+Create two parameter templates in InvenTree:
 
-> **_NOTE:_** When C1 in the above example rolls over, the plugin will loop back to the first IPN.
-> This will cause duplicate IPNs if your InvenTree allows duplicate IPNs.
-> If your InvenTree does not allow duplicate IPNs, this will cause an error at the moment!
-> This will be addressed in an upcoming update.
+- **SA_CCC**: For the 3-letter category code (e.g., `ELC`, `MEC`, `PCB`)
+- **SA_SS**: For the 2-digit subcategory code (e.g., `11`, `22`, `01`)
 
-### Literals (Immutable)
-Anything encased in `()` will be rendered as-is. no change will be made to anything within.
+### 2. Assign Parameters to Categories
 
-Example: `(A6C)` will _always_ render as "A6C", regardless of other groups
+For each part category that should use auto-generated IPNs:
 
-### Numeric
-Numbers that should change over time should be encased in `{}`
-- `{5}` respresents a number with max 5 digits
-- `{25+}` represents a number 25-99
+1. Go to the category
+2. Add the `SA_CCC` parameter with the appropriate 3-letter code
+3. Add the `SA_SS` parameter with the appropriate 2-digit code
 
-Example: `{5+}{3}` will result in this range: 5000-9999
+### 3. Enable Parameter Inheritance
 
-### Characters
-Characters that change should be encased in `[]`
-- `[abc]` represents looping through the letters `a`, `b`, `c` in order.
-- `[a-f]` represents looping through the letters from `a` to `f` alphabetaically
+Ensure that parts in these categories inherit the parameters from their category. InvenTree can be configured to copy category parameters to new parts automatically.
 
-These two directives can be combined.
-- `[aQc-f]` represents:
-- - `a`, `Q`, `c-f`
+## Validation Rules
 
-### Examples
-1. `(AB){3}[ab]` -> AB001a, AB001b, AB002a, AB021b, AB032a, etc
-2. `{2}[Aq](BD)` -> 01ABD, 01qBD, 02ABD, 02qBD, etc
-3. `{1}[a-d]{8+}` -> 1a8, 1a9, 1b8, 1b9, 1c8, 1c9, 1d8, 1d9, 2a8, etc
+The plugin validates the parameters before generating an IPN:
+
+| Parameter | Pattern      | Valid Examples      | Invalid Examples           |
+| --------- | ------------ | ------------------- | -------------------------- |
+| SA_CCC    | `^[A-Z]{3}$` | `ELC`, `MEC`, `ABC` | `elc`, `AB`, `ABCD`, `A1C` |
+| SA_SS     | `^\d{2}$`    | `00`, `11`, `99`    | `1`, `123`, `AB`           |
+
+If either parameter is missing or invalid, the plugin will log a warning and skip IPN generation for that part.
+
+## Concurrency Handling
+
+The plugin includes a retry mechanism to handle race conditions when multiple parts are created simultaneously in the same (CCC, SS) bucket:
+
+- Up to 10 retry attempts on integrity errors
+- Each retry recomputes the next sequence number from the current database state
+- Uses atomic transactions for safe updates
+
+## Overflow Protection
+
+The sequence number has a maximum of 99999. If a (CCC, SS) bucket reaches this limit:
+
+- **The plugin will NOT wrap around** to avoid duplicate IPNs
+- An error will be logged
+- The IPN will not be assigned
+
+This is intentional behavior to prevent duplicate IPN issues. If you reach this limit, consider:
+
+- Creating a new subcategory (different SS code)
+- Archiving old parts that are no longer needed
+
+## Examples
+
+### Category Structure Example
+
+```
+Electronics (SA_CCC=ELC)
+├── Resistors (SA_SS=11)
+│   └── SMD Resistors
+│       └── 0805 Package
+├── Capacitors (SA_SS=12)
+└── ICs (SA_SS=21)
+
+Mechanical (SA_CCC=MEC)
+├── Fasteners (SA_SS=11)
+└── Enclosures (SA_SS=21)
+```
+
+### Generated IPNs
+
+| Part Category   | SA_CCC | SA_SS | Generated IPN     |
+| --------------- | ------ | ----- | ----------------- |
+| First resistor  | ELC    | 11    | SAPN-ELC-11-00001 |
+| Second resistor | ELC    | 11    | SAPN-ELC-11-00002 |
+| First capacitor | ELC    | 12    | SAPN-ELC-12-00001 |
+| First fastener  | MEC    | 11    | SAPN-MEC-11-00001 |
+| Third resistor  | ELC    | 11    | SAPN-ELC-11-00003 |
+
+## Troubleshooting
+
+### IPN not generated
+
+1. Check that the plugin is enabled and "Active" is on
+2. Verify "On Create" is enabled for new parts
+3. Check that the part has both `SA_CCC` and `SA_SS` parameters with valid values
+4. Review InvenTree logs for warnings from "SAPN Generator"
+
+### Parameters not appearing on parts
+
+1. Ensure parameter templates exist for `SA_CCC` and `SA_SS`
+2. Check that category parameters are set correctly
+3. Verify InvenTree is configured to inherit parameters from categories
+
+### Duplicate IPNs
+
+This should not happen if InvenTree has unique IPN enforcement enabled. If you see duplicates:
+
+1. Check if InvenTree's "Enforce unique IPN" setting is enabled
+2. The plugin includes retry logic to prevent race conditions
+3. Review logs for any error messages
+
+## Development
+
+### Running Tests
+
+```bash
+cd ipn_generator/tests
+python -m pytest test_sapn_generator.py -v
+```
+
+### Project Structure
+
+```
+inventree-sapn-generator/
+├── ipn_generator/
+│   ├── __init__.py
+│   ├── generator.py          # Main plugin code
+│   └── tests/
+│       ├── __init__.py
+│       ├── test_IPNGenerator.py    # Original tests (legacy)
+│       └── test_sapn_generator.py  # SAPN-specific tests
+├── pyproject.toml
+├── README.md
+└── LICENSE
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Credits
+
+Based on [inventree-ipn-generator](https://github.com/LavissaWoW/inventree-ipn-generator)

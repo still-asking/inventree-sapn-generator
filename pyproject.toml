@@ -3,9 +3,9 @@ requires = ['setuptools>=61.0']
 build-backend = 'setuptools.build_meta'
 
 [project]
-name = "inventree-ipn-generator"
-version = "0.1.2"
-description = "InvenTree plugin to automatically generate and assign Internal Part Numbers to parts"
+name = "inventree-sapn-generator"
+version = "0.2.0"
+description = "InvenTree plugin to automatically generate SAPN (Sequential Auto Part Numbers) using SA_CCC and SA_SS parameters"
 authors = [
     {name = "Nichlas Walsøe", email = "lavissawow@gmail.com"}
 ]
@@ -20,10 +20,10 @@ classifiers = [
 requires-python = ">=3.9"
 
 [project.urls]
-"Homepage" = "https://github.com/LavissaWoW/inventree-ipn-generator"
+"Homepage" = "https://github.com/still-asking/inventree-sapn-generator"
 
 [project.entry-points."inventree_plugins"]
-IPNGenerator = 'ipn_generator.generator:AutoGenIPNPlugin'
+SAPNGenerator = 'ipn_generator.generator:SAPNGeneratorPlugin'
 
 [tool.ruff.lint]
 ignore = [
