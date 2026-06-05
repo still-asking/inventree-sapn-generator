@@ -1,6 +1,6 @@
 from plugin import InvenTreePlugin
 from plugin.mixins import EventMixin, SettingsMixin
-from part.models import Part, PartParameter
+from part.models import Part
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
@@ -33,12 +33,14 @@ def validate_ss(value: str) -> bool:
 
 
 def get_part_parameter_value(part, parameter_name: str) -> str | None:
-    """Get the value of a part parameter by name."""
+    """Get the value of a part parameter by name.
+
+    Uses the InvenTreeParameterMixin.get_parameter() helper (InvenTree 1.3+),
+    where parameters are stored in the generic common.models.Parameter model
+    rather than the old part.models.PartParameter model.
+    """
     try:
-        param = PartParameter.objects.filter(
-            part=part,
-            template__name=parameter_name
-        ).first()
+        param = part.get_parameter(parameter_name)
         if param:
             return param.data
     except Exception as e:
